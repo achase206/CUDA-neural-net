@@ -16,7 +16,15 @@ Perform profiling tests on Perlmutter, including analysis of Roofline plots.
 Analyze the time cost of training your model with respect to the number of hidden layers, the size of the hidden layers, and the size of the training dataset.
 Include your data and plots here, and explain your conclusions regarding the profiling results.
 
-## Task 3 - Discuss the Code
+## Task 3 - Increase the Size of the Calculation
+
+Note that, in its original form, the calculation is too small to effectively utilize Perlmutter's resources.
+Modify your code to solve a more physically complex problem that can better utilize the Perlmutter GPUs.
+For example, what if instead of trying to learn a Morse potential for a two-body system, you tried to learn a potential energy surface for a three-body or four-body system?
+
+Change the code to run with this more complex system, and repeat your profiling calculations.
+
+## Task 4 - Discuss the Code
 
 Discuss your code's parallelization strategy.
 Why did you choose this strategy?
