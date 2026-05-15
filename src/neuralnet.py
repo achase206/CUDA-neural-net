@@ -2,6 +2,9 @@ import numpy as np
 import time
 import math
 import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
+import sys
 
 # GAME PLAN!!!!!
 # gpuarray.to_gpu(some data)
@@ -44,7 +47,6 @@ class Layer:
         self.weights_grad = np.zeros(
             (self.size, self.previous_layer.size), dtype=np.float32
         )
-        # self.biases_grad = np.zeros((self.size,), dtype=np.float32)
         self.biases_grad = np.zeros((self.size, 1), dtype=np.float32)
         self.delta = np.zeros((self.size,), dtype=np.float32)
 
@@ -72,7 +74,6 @@ class Layer:
             )
 
         self.biases_grad += np.sum(self.delta, axis=1, keepdims=True)
-        # self.weights_grad += np.outer(self.delta, self.previous_layer.activations)
         self.weights_grad += np.dot(self.delta, self.previous_layer.activations.T)
 
     def apply_gradient(self, batch_size, training_rate):
@@ -109,7 +110,7 @@ class Network:
 
                 current_batch = iend - istart
 
-                # Now grab matrix of refs instead of one at a time
+                # Grab entire matrix of refs instead of one at a time
                 references = refs_shuffled[istart:iend].reshape(1, current_batch)
                 self.layers[0].activations = inputs_shuffled[istart:iend].reshape(
                     1, current_batch
@@ -132,25 +133,6 @@ class Network:
                     self.layers[-1 - ilayer].backpropagation(references)
                 backpropagation_time += time.time() - start_time
 
-                # for iref in range(istart, iend):
-                #     reference = np.array( refs_shuffled[iref], dtype=np.float32 )
-
-                #     # Set the input layer
-                #     self.layers[0].activations[0] = inputs_shuffled[iref]
-
-                #     # Feedforward through the other layers
-                #     start_time = time.time()
-                #     for ilayer in range( 1, len(self.layers) ):
-                #         self.layers[ilayer].feedforward()
-                #     loss += np.sum( (self.layers[-1].activations - reference)**2 )
-                #     feedforward_time += time.time() - start_time
-
-                #     # Do backpropagation
-                #     start_time = time.time()
-                #     for ilayer in range( len(self.layers)-1 ):
-                #         self.layers[-1-ilayer].backpropagation(reference)
-                #     backpropagation_time += time.time() - start_time
-
                 for ilayer in range(1, len(self.layers)):
                     self.layers[ilayer].apply_gradient(batch_size, training_rate)
 
@@ -160,6 +142,24 @@ class Network:
         print(f"Feedforward time: {feedforward_time}")
         print(f"Backpropagation time: {backpropagation_time}")
 
+    def save_weights(self, filename):
+        model_dict = {}
+        # Starting after input layer, save weights/biases
+        for i, layer in enumerate(self.layers[1:]):
+            model_dict[f"layer_{i}_weights"] = layer.weights
+            model_dict[f"layer_{i}_biases"] = layer.biases
+
+        # np.savez stores multiple arrays into single file
+        np.savez_compressed(filename, **model_dict)
+        print(f"Model saved to {filename}")
+
+    def load_weights(self, filename):
+        with np.load(filename) as model:
+            for i, layer in enumerate(self.layers[1:]):
+                layer.weights = model[f"layer_{i}_weights"]
+                layer.biases = model[f"layer_{i}_biases"]
+        print(f"Model weights loaded from {filename}")
+
 
 def morse_potential(De, re, a, r):
     inner = 1.0 - math.exp(-a * (r - re))
@@ -167,13 +167,44 @@ def morse_potential(De, re, a, r):
 
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Train or evaluate neural net")
+
+    # Name of the model to train or evaluate (REQUIRED)
+    parser.add_argument("model", help="Name of model to train or load")
+    parser.add_argument(
+        "--epochs", type=int, default=500, help="Number of training epochs"
+    )
+
+    # Learning rate for training
+    parser.add_argument(
+        "-lr",
+        "--learning_rate",
+        type=float,
+        default=0.05,
+        help="Number of training epochs",
+    )
+
+    # Run mode (train or evaluate)
+    parser.add_argument("-t", "--train", action="store_true", help="Set mode to train")
+    parser.add_argument(
+        "-e", "--eval", action="store_true", help="Set mode to evaluate"
+    )
+
+    args = parser.parse_args()
+
+    # Create full file name from models directory
+    model_path = Path("models")
+    model_path.mkdir(parents=True, exist_ok=True)
+    filename = f"models/{args.model}.npz"
+
+    # Set morse params
     ninputs = 300
     De = 1.0
     re = 1.0
     a = 1.0
     min_rvalue = 0.5
     max_rvalue = 2.0
-    training_rate = 0.05
 
     # Randomly generate a set of distances
     rvalues = np.random.uniform(min_rvalue, max_rvalue, (ninputs,)).astype(np.float32)
@@ -190,29 +221,50 @@ if __name__ == "__main__":
         max_rvalue - min_rvalue
     )
 
-    net = Network([1, 16, 16, 1], rvalues_normalized, erefs_normalized)
-    start_time = time.time()
-    net.train(500)
-    print(f"Training time: {time.time() - start_time}")
+    # Train the model
+    if args.train:
 
-    n_test = 300
-    r_test = np.linspace(min_rvalue, max_rvalue, n_test).astype(np.float32)
+        training_rate = args.learning_rate
+        print(f"training rate: {training_rate}")
+        net = Network([1, 16, 16, 1], rvalues_normalized, erefs_normalized)
+        start_time = time.time()
+        net.train(args.epochs)
+        print(f"Training time: {time.time() - start_time}")
+        net.save_weights(filename)
 
-    r_test_norm = (r_test - (max_rvalue + min_rvalue) / 2.0) / (max_rvalue - min_rvalue)
-    r_test_norm = r_test_norm.reshape(1, n_test)
+    # Evaluate model performance and plot
+    elif args.eval:
 
-    # perform forward pass through trained net
-    net.layers[0].activations = r_test_norm
-    for ilayer in range(1, len(net.layers)):
-        net.layers[ilayer].feedforward()
+        net = Network([1, 16, 16, 1], rvalues_normalized, erefs_normalized)
+        net.load_weights(filename)
+        n_test = 300
+        r_test = np.linspace(min_rvalue, max_rvalue, n_test).astype(np.float32)
 
-    # extract energy and un-normalize
-    pred_e_norm = net.layers[-1].activations[0]
-    pred_energy = (pred_e_norm * std_e) + mean_e
+        r_test_norm = (r_test - (max_rvalue + min_rvalue) / 2.0) / (
+            max_rvalue - min_rvalue
+        )
+        r_test_norm = r_test_norm.reshape(1, n_test)
 
-    true_energy = np.array([morse_potential(De, re, a, r) for r in r_test])
+        # perform forward pass through trained net
+        net.layers[0].activations = r_test_norm
+        for ilayer in range(1, len(net.layers)):
+            net.layers[ilayer].feedforward()
 
-    plt.plot(r_test, true_energy, label="true")
-    plt.plot(r_test, pred_energy, label="pred")
-    plt.legend()
-    plt.savefig("morse.png")
+        # extract energy and un-normalize
+        pred_e_norm = net.layers[-1].activations[0]
+        pred_energy = (pred_e_norm * std_e) + mean_e
+
+        true_energy = np.array([morse_potential(De, re, a, r) for r in r_test])
+
+        plt.plot(r_test, true_energy, label="true")
+        plt.plot(r_test, pred_energy, label="pred")
+        plt.legend()
+
+        plot_path = Path("plots")
+        plot_path.mkdir(parents=True, exist_ok=True)
+        plot_name = f"plots/{args.model}.png"
+        plt.savefig(plot_name)
+
+    # User did not specify a run mode, exit safely
+    else:
+        sys.exit("Run mode not specified (--train or --eval)")
