@@ -1,6 +1,6 @@
 {
     "run": "morse_basic",
-    "problem": "morse",
+    "problem": "Morse",
     "ninputs": 320,
     "batch_size": 32,
     "epochs": 500,

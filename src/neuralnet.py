@@ -337,6 +337,7 @@ class Network:
         # current inputs/references to GPU
         # send back loss to cpu for each batch
 
+        ninputs = len(self.training_inputs)
         feedforward_time = 0.0
         backpropagation_time = 0.0
         for iepoch in range(nepochs):
@@ -399,7 +400,7 @@ class Network:
         print(f"Feedforward time: {feedforward_time}")
         print(f"Backpropagation time: {backpropagation_time}")
 
-    def save_weights(self, filename):
+    def save_weights(self, filename, norm=None):
         model_dict = {}
         # Starting after input layer, save weights/biases
         for i, layer in enumerate(self.layers[1:]):
@@ -408,6 +409,10 @@ class Network:
                 layer.biases = layer.biases_gpu.get()
             model_dict[f"layer_{i}_weights"] = layer.weights
             model_dict[f"layer_{i}_biases"] = layer.biases
+
+        if norm is not None:
+            model_dict["mean_e"] = np.float32(norm["mean_e"])
+            model_dict["std_e"] = np.float32(norm["std_e"])
 
         # np.savez stores multiple arrays into single file
         np.savez_compressed(filename, **model_dict)
@@ -423,7 +428,14 @@ class Network:
                 if layer.device == "gpu":
                     layer.weights_gpu.set(layer.weights)
                     layer.biases_gpu.set(layer.biases)
+            norm = None
+            if "mean_e" in model and "std_e" in model:
+                norm = {
+                    "mean_e": float(model["mean_e"]),
+                    "std_e": float(model["std_e"]),
+                }
         print(f"Model weights loaded from {filename}")
+        return norm
 
 
 def morse_potential(De, re, a, r):
@@ -465,24 +477,55 @@ def load_setup(filename):
     return run_data
 
 
+class Morse:
+    def __init__(self):
+        self.De = 1.0
+        self.re = 1.0
+        self.a = 1.0
+        self.min_rvalue = 0.5
+        self.max_rvalue = 2.0
+
+    def _normalize_r(self, rvalues):
+        return (rvalues - (self.max_rvalue + self.min_rvalue) / 2.0) / (
+            self.max_rvalue - self.min_rvalue
+        )
+
+    def training_data(self, ninputs):
+        rvalues = np.random.uniform(
+            self.min_rvalue, self.max_rvalue, (ninputs,)
+        ).astype(np.float32)
+        erefs = np.array(
+            [morse_potential(self.De, self.re, self.a, r) for r in rvalues],
+            dtype=np.float32,
+        )
+        mean_e = np.mean(erefs)
+        std_e = np.std(erefs)
+        return (
+            self._normalize_r(rvalues),
+            (erefs - mean_e) / std_e,
+            {"mean_e": mean_e, "std_e": std_e},
+        )
+
+    def eval_grid(self, n_test=300):
+        """Sorted r grid for plotting (not the random training set)."""
+        r_test = np.linspace(self.min_rvalue, self.max_rvalue, n_test, dtype=np.float32)
+        r_test_norm = self._normalize_r(r_test).reshape(1, n_test)
+        true_energy = np.array(
+            [morse_potential(self.De, self.re, self.a, r) for r in r_test],
+            dtype=np.float32,
+        )
+        return r_test, r_test_norm, true_energy
+
+
+def train_AB3(): ...
+
+
+def eval_AB3(): ...
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train or evaluate neural net")
-
-    # # Name of the model to train or evaluate (REQUIRED)
-    # parser.add_argument("model", help="Name of model to train or load")
-    # parser.add_argument(
-    #     "--epochs", type=int, default=500, help="Number of training epochs"
-    # )
-
-    # # Learning rate for training
-    # parser.add_argument(
-    #     "-lr",
-    #     "--learning_rate",
-    #     type=float,
-    #     default=0.05,
-    #     help="Number of training epochs",
-    # )
 
     parser.add_argument("run", help="Name of setup run.json to train or evaluate")
 
@@ -530,59 +573,49 @@ if __name__ == "__main__":
     model_path.mkdir(parents=True, exist_ok=True)
     filename = f"models/{run}_{device}.npz"
 
-    # Set morse params
-    De = 1.0
-    re = 1.0
-    a = 1.0
-    min_rvalue = 0.5
-    max_rvalue = 2.0
-
-    # Randomly generate a set of distances
-    rvalues = np.random.uniform(min_rvalue, max_rvalue, (ninputs,)).astype(np.float32)
-
-    # Generate the reference energies for each of these distances
-    erefs = np.empty((ninputs,), dtype=np.float32)
-    for idx, r in enumerate(rvalues):
-        erefs[idx] = morse_potential(De, re, a, r)
-    mean_e = np.mean(erefs)
-    std_e = np.std(erefs)
-    erefs_normalized = (erefs - mean_e) / std_e
-
-    rvalues_normalized = (rvalues - (max_rvalue + min_rvalue) / 2.0) / (
-        max_rvalue - min_rvalue
-    )
-
     # Train the model
     if args.train:
-
         print(f"training rate: {training_rate}")
-        net = Network(
-            architecture, rvalues_normalized, erefs_normalized, batch_size, device
-        )
+
+        if problem == "Morse":
+            problem_obj = Morse()
+            r_norm, e_norm, norm = problem_obj.training_data(ninputs)
+        elif problem == "AB3":
+            ...
+        else:
+            raise ValueError(f"Problem type not recognized: {problem}")
+
+        net = Network(architecture, r_norm, e_norm, batch_size, device)
         start_time = time.time()
         net.train(epochs, training_rate)
         print(f"Training time: {time.time() - start_time}")
-        net.save_weights(filename)
+        net.save_weights(filename, norm=norm)
 
     # Evaluate model performance and plot
     elif args.eval:
 
         n_test = 300
+        if problem == "Morse":
+            problem_obj = Morse()
+            r_test, r_test_norm, true_energy = problem_obj.eval_grid(n_test)
+        elif problem == "AB3":
+            ...
+        else:
+            raise ValueError(f"Problem type not recognized: {problem}")
+
         net_batch = max(batch_size, n_test)
         net = Network(
             architecture,
-            rvalues_normalized,
-            erefs_normalized,
+            np.zeros((1, n_test), dtype=np.float32),
+            np.zeros((1, n_test), dtype=np.float32),
             net_batch,
             device,
         )
-        net.load_weights(filename)
-        r_test = np.linspace(min_rvalue, max_rvalue, n_test).astype(np.float32)
-
-        r_test_norm = (r_test - (max_rvalue + min_rvalue) / 2.0) / (
-            max_rvalue - min_rvalue
-        )
-        r_test_norm = r_test_norm.reshape(1, n_test)
+        norm = net.load_weights(filename)
+        if norm is None:
+            raise ValueError(
+                f"Missing mean_e/std_e in {filename}; retrain with current code."
+            )
 
         # perform forward pass through trained net
         for layer in net.layers:
@@ -593,14 +626,11 @@ if __name__ == "__main__":
         for ilayer in range(1, len(net.layers)):
             net.layers[ilayer].feedforward()
 
-        # extract energy and un-normalize
         if net.device == "gpu":
             pred_e_norm = np.asarray(net.layers[-1].activations_gpu.get())[0, :n_test]
         else:
             pred_e_norm = net.layers[-1].activations[0, :n_test]
-        pred_energy = (pred_e_norm * std_e) + mean_e
-
-        true_energy = np.array([morse_potential(De, re, a, r) for r in r_test])
+        pred_energy = (pred_e_norm * norm["std_e"]) + norm["mean_e"]
 
         plt.plot(r_test, true_energy, label="true")
         plt.plot(r_test, pred_energy, label="pred")
