@@ -1,0 +1,14 @@
+{
+    "run": "morse_basic",
+    "problem": "morse",
+    "ninputs": 320,
+    "batch_size": 32,
+    "epochs": 500,
+    "training_rate": 0.05,
+    "architecture": [
+        1,
+        16,
+        16,
+        1
+    ]
+}

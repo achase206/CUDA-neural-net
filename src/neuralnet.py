@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import argparse
 from pathlib import Path
 import sys
+import json
+import os
 
 from pycuda import gpuarray
 import pycuda.autoinit
@@ -429,24 +431,60 @@ def morse_potential(De, re, a, r):
     return De * inner * inner
 
 
+def load_setup(filename):
+
+    model_path = Path("setup")
+    model_path.mkdir(parents=True, exist_ok=True)
+    filepath = f"setup/{filename}"
+
+    # Parse setup file
+    if os.path.exists(filepath):
+        with open(filepath, "r") as file:
+            try:
+                run_data = json.load(file)
+                print("Run setup json parsed successfully")
+            except json.JSONDecodeError:
+                print("Error: file found but could not be parsed")
+    else:
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    required = {
+        "run",
+        "problem",
+        "ninputs",
+        "batch_size",
+        "epochs",
+        "training_rate",
+        "architecture",
+    }
+
+    missing = required - run_data.keys()
+    if missing:
+        raise KeyError(f"Missing required setup keys: {missing}")
+
+    return run_data
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train or evaluate neural net")
 
-    # Name of the model to train or evaluate (REQUIRED)
-    parser.add_argument("model", help="Name of model to train or load")
-    parser.add_argument(
-        "--epochs", type=int, default=500, help="Number of training epochs"
-    )
+    # # Name of the model to train or evaluate (REQUIRED)
+    # parser.add_argument("model", help="Name of model to train or load")
+    # parser.add_argument(
+    #     "--epochs", type=int, default=500, help="Number of training epochs"
+    # )
 
-    # Learning rate for training
-    parser.add_argument(
-        "-lr",
-        "--learning_rate",
-        type=float,
-        default=0.05,
-        help="Number of training epochs",
-    )
+    # # Learning rate for training
+    # parser.add_argument(
+    #     "-lr",
+    #     "--learning_rate",
+    #     type=float,
+    #     default=0.05,
+    #     help="Number of training epochs",
+    # )
+
+    parser.add_argument("run", help="Name of setup run.json to train or evaluate")
 
     # Run mode (train or evaluate)
     parser.add_argument(
@@ -462,6 +500,20 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Extract values and ensure that requirements are met
+    data = load_setup(args.run)
+    run = data["run"]
+    problem = data["problem"]
+    ninputs = data["ninputs"]
+    batch_size = data["batch_size"]
+    epochs = data["epochs"]
+    training_rate = data["training_rate"]
+    architecture = data["architecture"]
+
+    # Check to make sure that ninputs and batch size are divisible
+    if ninputs % batch_size != 0:
+        raise ValueError("ninputs for training must be divisble by batch_size")
+
     # Set device for training or evaluation
     if args.cpu:
         device = "cpu"
@@ -476,12 +528,9 @@ if __name__ == "__main__":
     # Create full file name from models directory
     model_path = Path("models")
     model_path.mkdir(parents=True, exist_ok=True)
-    filename = f"models/{args.model}.npz"
-
-    batch_size = 32  # make this an arg at some point
+    filename = f"models/{run}_{device}.npz"
 
     # Set morse params
-    ninputs = batch_size * 10
     De = 1.0
     re = 1.0
     a = 1.0
@@ -506,13 +555,12 @@ if __name__ == "__main__":
     # Train the model
     if args.train:
 
-        training_rate = args.learning_rate
         print(f"training rate: {training_rate}")
         net = Network(
-            [1, 16, 16, 1], rvalues_normalized, erefs_normalized, batch_size, device
+            architecture, rvalues_normalized, erefs_normalized, batch_size, device
         )
         start_time = time.time()
-        net.train(args.epochs, training_rate)
+        net.train(epochs, training_rate)
         print(f"Training time: {time.time() - start_time}")
         net.save_weights(filename)
 
@@ -522,7 +570,7 @@ if __name__ == "__main__":
         n_test = 300
         net_batch = max(batch_size, n_test)
         net = Network(
-            [1, 16, 16, 1],
+            architecture,
             rvalues_normalized,
             erefs_normalized,
             net_batch,
@@ -560,7 +608,7 @@ if __name__ == "__main__":
 
         plot_path = Path("plots")
         plot_path.mkdir(parents=True, exist_ok=True)
-        plot_name = f"plots/{args.model}.png"
+        plot_name = plot_path / f"{run}_{device}.png"
         plt.savefig(plot_name)
 
     # User did not specify a run mode, exit safely
