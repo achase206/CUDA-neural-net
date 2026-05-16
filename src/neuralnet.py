@@ -6,32 +6,49 @@ import argparse
 from pathlib import Path
 import sys
 
-# GAME PLAN!!!!!
-# gpuarray.to_gpu(some data)
-# need to do this for all the initilized matrices
-# Figure out how to do this with streams?
-#   Conceptually where is this appropriate?
-#   Which functions touch this data in matrices? I assume basically everything...
-#   Look into whether I need to rewrite everything in cuda or can I reuse some of what is here?
-#   Probably makes sense to keep this functionality as CPU mode vs GPU mode for debugging
-# Lets also clean up how we call these with argparse or something similar this is too crude rn
-# Focus on just getting this running asap and profiling then we can work on extending
-#   Make sure implementation remains very modular...
-# I don't think I can use numpy here for matrix multiplication, need to grab from gemm code?
+from pycuda import gpuarray
+import pycuda.autoinit
+
+from cuda_kernels import (
+    get_add_bias_kernel,
+    get_apply_weights_biases_kernel,
+    get_compute_delta_output_kernel,
+    get_sum_delta_rows_kernel,
+    get_compute_ReLU_deriv_kernel,
+    get_matrix_multiply_kernel,
+    get_transpose_matrix_kernel,
+)
+
+# TO-DOs
+#   Profile existing code on perlmutter, generate roofline models
+#   Add additional control to argparse for training params
+#   Brainstorm different models
+#   Allow a json file to specify the net layers
+#   Complete discussion of results
 
 
 class InputLayer:
-    def __init__(self, size):
+    def __init__(self, size, batch_size, device):
         self.size = size
+        self.current_batch = batch_size
+        self.device = device
         self.activations = np.zeros((self.size,), dtype=np.float32)
+        if self.device == "gpu":
+            # Same layout as Layer.activations_transposed_gpu; used in bp_gpu on layer 1.
+            self.activations_transposed_gpu = gpuarray.empty(
+                (batch_size, self.size), dtype=np.float32
+            )
 
 
 class Layer:
-    def __init__(self, size, previous_layer):
+    def __init__(self, size, previous_layer, batch_size, device):
         self.size = size
         self.previous_layer = previous_layer
         self.next_layer = None
         self.previous_layer.next_layer = self
+        self.batch_size = batch_size
+        self.current_batch = batch_size
+        self.device = device
 
         # He initialization
         stdev = np.sqrt(2.0 / self.previous_layer.size)
@@ -50,7 +67,53 @@ class Layer:
         self.biases_grad = np.zeros((self.size, 1), dtype=np.float32)
         self.delta = np.zeros((self.size,), dtype=np.float32)
 
+        # send data to gpu device if specified
+        if self.device == "gpu":
+            from pycuda import gpuarray
+
+            self.tile_size = 32
+            self.blocksize = self.tile_size
+
+            self.biases_gpu = gpuarray.to_gpu(self.biases)
+            self.weights_gpu = gpuarray.to_gpu(self.weights)
+
+            self.preactivations_gpu = gpuarray.zeros(
+                (self.size, batch_size), dtype=np.float32
+            )
+            self.activations_gpu = gpuarray.zeros(
+                (self.size, batch_size), dtype=np.float32
+            )
+            self.weights_grad_gpu = gpuarray.to_gpu(self.weights_grad)
+            self.biases_grad_gpu = gpuarray.to_gpu(self.biases_grad)
+            self.delta_gpu = gpuarray.zeros((self.size, batch_size), dtype=np.float32)
+
+            # Temp and tranpose buffers
+            self.weights_transposed_gpu = gpuarray.empty(
+                (self.previous_layer.size, self.size), dtype=np.float32
+            )
+            self.activations_transposed_gpu = gpuarray.empty(
+                (batch_size, self.size), dtype=np.float32
+            )
+            self.delta_temp_gpu = gpuarray.empty(
+                (self.size, batch_size), dtype=np.float32
+            )
+
+            # Get all cuda kernels for gpu implementation
+            self.add_bias = get_add_bias_kernel()
+            self.apply_weights_biases = get_apply_weights_biases_kernel()
+            self.compute_delta_output = get_compute_delta_output_kernel()
+            self.sum_delta_rows = get_sum_delta_rows_kernel()
+            self.compute_ReLU_deriv = get_compute_ReLU_deriv_kernel()
+            self.matrix_multiply = get_matrix_multiply_kernel()
+            self.transpose_matrix = get_transpose_matrix_kernel()
+
     def feedforward(self):
+        if self.device == "gpu":
+            self.ff_gpu()
+        else:
+            self.ff_cpu()
+
+    def ff_cpu(self):
         self.preactivations = (
             np.dot(self.weights, self.previous_layer.activations) + self.biases
         )
@@ -61,7 +124,51 @@ class Layer:
             # Apply the activation function
             self.activations = np.maximum(0, self.preactivations)  # ReLU
 
+    def ff_gpu(self):
+        M = self.size
+        N = self.previous_layer.current_batch
+        K = self.previous_layer.size
+
+        # grid dimensions
+        grid_x = math.ceil(N / self.tile_size)
+        grid_y = math.ceil(M / self.tile_size)
+
+        self.matrix_multiply(
+            self.weights_gpu,
+            self.previous_layer.activations_gpu,
+            self.preactivations_gpu,
+            np.int32(M),
+            np.int32(N),
+            np.int32(K),
+            block=(self.blocksize, self.blocksize, 1),
+            grid=(grid_x, grid_y, 1),
+        )
+
+        # Only if hidden layer apply relu
+        if self.next_layer is None:
+            relu_flag = np.int32(0)
+        else:
+            relu_flag = np.int32(1)
+
+        self.add_bias(
+            self.preactivations_gpu,
+            self.biases_gpu,
+            self.activations_gpu,
+            np.int32(M),
+            np.int32(N),
+            relu_flag,
+            block=(self.blocksize, self.blocksize, 1),
+            grid=(grid_x, grid_y, 1),
+        )
+
     def backpropagation(self, reference):
+        if self.device == "gpu":
+            reference_gpu = gpuarray.to_gpu(reference)
+            self.bp_gpu(reference_gpu)
+        else:
+            self.bp_cpu(reference)
+
+    def bp_cpu(self, reference):
         if self.next_layer is None:  # Output layer
             # Get this from differentiating the cost function
             self.delta = self.activations - reference
@@ -76,25 +183,158 @@ class Layer:
         self.biases_grad += np.sum(self.delta, axis=1, keepdims=True)
         self.weights_grad += np.dot(self.delta, self.previous_layer.activations.T)
 
+    def bp_gpu(self, reference):
+        M_prev = self.previous_layer.size
+        M_curr = self.size
+        N_batch = self.current_batch
+
+        # Output layer
+        if self.next_layer is None:
+            grid_x = math.ceil(N_batch / self.tile_size)
+            grid_y = math.ceil(M_curr / self.tile_size)
+            # Just take diff between activations and reference for output layer
+            self.compute_delta_output(
+                self.activations_gpu,
+                reference,
+                self.delta_gpu,
+                np.int32(M_curr),
+                np.int32(N_batch),
+                block=(self.blocksize, self.blocksize, 1),
+                grid=(grid_x, grid_y, 1),
+            )
+        # Hidden layer
+        else:
+            M_next = self.next_layer.size
+            # transpose next layer's weights
+            grid_x = math.ceil(M_next / self.tile_size)
+            grid_y = math.ceil(M_curr / self.tile_size)
+            self.transpose_matrix(
+                self.next_layer.weights_gpu,
+                self.next_layer.weights_transposed_gpu,
+                np.int32(M_next),
+                np.int32(M_curr),
+                block=(self.blocksize, self.blocksize, 1),
+                grid=(grid_x, grid_y, 1),
+            )
+
+            # multiply weights by delta to get temp_delta
+            grid_x = math.ceil(N_batch / self.tile_size)
+            grid_y = math.ceil(M_curr / self.tile_size)
+            self.matrix_multiply(
+                self.next_layer.weights_transposed_gpu,
+                self.next_layer.delta_gpu,
+                self.delta_temp_gpu,
+                np.int32(M_curr),
+                np.int32(N_batch),
+                np.int32(M_next),
+                block=(self.blocksize, self.blocksize, 1),
+                grid=(grid_x, grid_y, 1),
+            )
+
+            # take ReLU deriv
+            self.compute_ReLU_deriv(
+                self.delta_temp_gpu,
+                self.preactivations_gpu,
+                self.biases_gpu,
+                self.delta_gpu,
+                np.int32(M_curr),
+                np.int32(N_batch),
+                block=(self.blocksize, self.blocksize, 1),
+                grid=(grid_x, grid_y, 1),
+            )
+
+        # For all layers calculate the gradients
+        # First transpose the previous layers activations
+        grid_x = math.ceil(M_prev / self.tile_size)
+        grid_y = math.ceil(N_batch / self.tile_size)
+        self.transpose_matrix(
+            self.previous_layer.activations_gpu,
+            self.previous_layer.activations_transposed_gpu,
+            np.int32(M_prev),
+            np.int32(N_batch),
+            block=(self.blocksize, self.blocksize, 1),
+            grid=(grid_x, grid_y, 1),
+        )
+
+        # Multiply the delta and transposed activations to get weights grad
+        grid_x = math.ceil(M_prev / self.tile_size)
+        grid_y = math.ceil(M_curr / self.tile_size)
+        self.matrix_multiply(
+            self.delta_gpu,
+            self.previous_layer.activations_transposed_gpu,
+            self.weights_grad_gpu,
+            np.int32(M_curr),
+            np.int32(M_prev),
+            np.int32(N_batch),
+            block=(self.blocksize, self.blocksize, 1),
+            grid=(grid_x, grid_y, 1),
+        )
+
+        # Sum across delta rows to get the biases grad
+        grid_x = math.ceil(M_curr / self.tile_size)
+        self.sum_delta_rows(
+            self.delta_gpu,
+            self.biases_grad_gpu,
+            np.int32(M_curr),
+            np.int32(N_batch),
+            block=(self.blocksize, 1, 1),  # 1D block
+            grid=(grid_x, 1, 1),  # 1D grid
+        )
+
     def apply_gradient(self, batch_size, training_rate):
+        if self.device == "gpu":
+            self.grad_gpu(batch_size, training_rate)
+        else:
+            self.grad_cpu(batch_size, training_rate)
+
+    def grad_cpu(self, batch_size, training_rate):
         self.weights = self.weights - (training_rate / batch_size) * self.weights_grad
         self.biases = self.biases - (training_rate / batch_size) * self.biases_grad
         self.weights_grad.fill(0.0)
         self.biases_grad.fill(0.0)
 
+    def grad_gpu(self, batch_size, training_rate):
+        M = self.size
+        K = self.previous_layer.size
+
+        grid_x = math.ceil(K / self.blocksize)
+        grid_y = math.ceil(M / self.blocksize)
+
+        self.apply_weights_biases(
+            self.weights_gpu,
+            self.weights_grad_gpu,
+            self.biases_gpu,
+            self.biases_grad_gpu,
+            np.int32(batch_size),
+            np.int32(M),
+            np.int32(K),
+            np.float32(training_rate),
+            block=(self.blocksize, self.blocksize, 1),
+            grid=(grid_x, grid_y, 1),
+        )
+
 
 class Network:
-    def __init__(self, sizes, training_inputs, training_references):
+    def __init__(self, sizes, training_inputs, training_references, batch_size, device):
         self.layers = []
         self.training_inputs = training_inputs
         self.training_references = training_references
+        self.device = device
+        self.batch_size = batch_size
 
-        new_layer = InputLayer(1)
+        new_layer = InputLayer(1, batch_size, device)
         self.layers.append(new_layer)
         for ilayer in range(1, len(sizes)):
-            self.layers.append(Layer(sizes[ilayer], self.layers[-1]))
+            self.layers.append(
+                Layer(sizes[ilayer], self.layers[-1], batch_size, device)
+            )
 
-    def train(self, nepochs):
+    def train(self, nepochs, training_rate):
+
+        # Only pass from CPU to GPU twice per batch
+        # current inputs/references to GPU
+        # send back loss to cpu for each batch
+
         feedforward_time = 0.0
         backpropagation_time = 0.0
         for iepoch in range(nepochs):
@@ -103,12 +343,14 @@ class Network:
             inputs_shuffled = self.training_inputs[indices]
             refs_shuffled = self.training_references[indices]
 
-            # batch_size = ninputs
-            batch_size = 32
-            for istart in range(0, ninputs, batch_size):
-                iend = min(istart + batch_size, ninputs)
+            for istart in range(0, ninputs, self.batch_size):
+                iend = min(istart + self.batch_size, ninputs)
 
                 current_batch = iend - istart
+
+                self.layers[0].current_batch = current_batch
+                for ilayer in range(1, len(self.layers)):
+                    self.layers[ilayer].current_batch = current_batch
 
                 # Grab entire matrix of refs instead of one at a time
                 references = refs_shuffled[istart:iend].reshape(1, current_batch)
@@ -116,14 +358,16 @@ class Network:
                     1, current_batch
                 )
 
+                # send activations to gpu if using that device
+                if self.device == "gpu":
+                    self.layers[0].activations_gpu = gpuarray.to_gpu(
+                        self.layers[0].activations
+                    )
+
                 # Feedforward through the other layers
                 start_time = time.time()
                 for ilayer in range(1, len(self.layers)):
                     self.layers[ilayer].feedforward()
-
-                # Calculate loss across all layers
-                for ilayer in range(1, len(self.layers)):
-                    loss += np.sum((self.layers[ilayer].activations - references) ** 2)
 
                 feedforward_time += time.time() - start_time
 
@@ -133,8 +377,19 @@ class Network:
                     self.layers[-1 - ilayer].backpropagation(references)
                 backpropagation_time += time.time() - start_time
 
+                # Calculate loss (after backprop: output delta = activations - reference)
+                if self.device == "gpu":
+                    squared_error_gpu = self.layers[-1].delta_gpu ** 2
+                    batch_loss_gpu = gpuarray.sum(squared_error_gpu)
+                    loss += float(batch_loss_gpu.get())
+                else:
+                    for ilayer in range(1, len(self.layers)):
+                        loss += np.sum(
+                            (self.layers[ilayer].activations - references) ** 2
+                        )
+
                 for ilayer in range(1, len(self.layers)):
-                    self.layers[ilayer].apply_gradient(batch_size, training_rate)
+                    self.layers[ilayer].apply_gradient(current_batch, training_rate)
 
             standard_deviation = math.sqrt(loss / ninputs)
             print(f"Epoch, deviation: {iepoch}, {standard_deviation}")
@@ -146,6 +401,9 @@ class Network:
         model_dict = {}
         # Starting after input layer, save weights/biases
         for i, layer in enumerate(self.layers[1:]):
+            if layer.device == "gpu":
+                layer.weights = layer.weights_gpu.get()
+                layer.biases = layer.biases_gpu.get()
             model_dict[f"layer_{i}_weights"] = layer.weights
             model_dict[f"layer_{i}_biases"] = layer.biases
 
@@ -156,8 +414,13 @@ class Network:
     def load_weights(self, filename):
         with np.load(filename) as model:
             for i, layer in enumerate(self.layers[1:]):
-                layer.weights = model[f"layer_{i}_weights"]
-                layer.biases = model[f"layer_{i}_biases"]
+                layer.weights = np.asarray(
+                    model[f"layer_{i}_weights"], dtype=np.float32
+                )
+                layer.biases = np.asarray(model[f"layer_{i}_biases"], dtype=np.float32)
+                if layer.device == "gpu":
+                    layer.weights_gpu.set(layer.weights)
+                    layer.biases_gpu.set(layer.biases)
         print(f"Model weights loaded from {filename}")
 
 
@@ -186,20 +449,39 @@ if __name__ == "__main__":
     )
 
     # Run mode (train or evaluate)
-    parser.add_argument("-t", "--train", action="store_true", help="Set mode to train")
     parser.add_argument(
-        "-e", "--eval", action="store_true", help="Set mode to evaluate"
+        "-t", "--train", action="store_true", help="Sets model to train"
+    )
+    parser.add_argument(
+        "-e", "--eval", action="store_true", help="Set model to evaluate"
     )
 
+    # Device mode (CPU or GPU)
+    parser.add_argument("--cpu", action="store_true", help="Sets device to CPU")
+    parser.add_argument("--gpu", action="store_true", help="Sets device to GPU")
+
     args = parser.parse_args()
+
+    # Set device for training or evaluation
+    if args.cpu:
+        device = "cpu"
+        print("Running on device = CPU")
+    elif args.gpu:
+        device = "gpu"
+        print("Running on device = GPU")
+    else:
+        device = "cpu"  # cpu by default
+        print("Running on default device = CPU")
 
     # Create full file name from models directory
     model_path = Path("models")
     model_path.mkdir(parents=True, exist_ok=True)
     filename = f"models/{args.model}.npz"
 
+    batch_size = 32  # make this an arg at some point
+
     # Set morse params
-    ninputs = 300
+    ninputs = batch_size * 10
     De = 1.0
     re = 1.0
     a = 1.0
@@ -226,18 +508,27 @@ if __name__ == "__main__":
 
         training_rate = args.learning_rate
         print(f"training rate: {training_rate}")
-        net = Network([1, 16, 16, 1], rvalues_normalized, erefs_normalized)
+        net = Network(
+            [1, 16, 16, 1], rvalues_normalized, erefs_normalized, batch_size, device
+        )
         start_time = time.time()
-        net.train(args.epochs)
+        net.train(args.epochs, training_rate)
         print(f"Training time: {time.time() - start_time}")
         net.save_weights(filename)
 
     # Evaluate model performance and plot
     elif args.eval:
 
-        net = Network([1, 16, 16, 1], rvalues_normalized, erefs_normalized)
-        net.load_weights(filename)
         n_test = 300
+        net_batch = max(batch_size, n_test)
+        net = Network(
+            [1, 16, 16, 1],
+            rvalues_normalized,
+            erefs_normalized,
+            net_batch,
+            device,
+        )
+        net.load_weights(filename)
         r_test = np.linspace(min_rvalue, max_rvalue, n_test).astype(np.float32)
 
         r_test_norm = (r_test - (max_rvalue + min_rvalue) / 2.0) / (
@@ -246,12 +537,19 @@ if __name__ == "__main__":
         r_test_norm = r_test_norm.reshape(1, n_test)
 
         # perform forward pass through trained net
+        for layer in net.layers:
+            layer.current_batch = n_test
         net.layers[0].activations = r_test_norm
+        if net.device == "gpu":
+            net.layers[0].activations_gpu = gpuarray.to_gpu(net.layers[0].activations)
         for ilayer in range(1, len(net.layers)):
             net.layers[ilayer].feedforward()
 
         # extract energy and un-normalize
-        pred_e_norm = net.layers[-1].activations[0]
+        if net.device == "gpu":
+            pred_e_norm = np.asarray(net.layers[-1].activations_gpu.get())[0, :n_test]
+        else:
+            pred_e_norm = net.layers[-1].activations[0, :n_test]
         pred_energy = (pred_e_norm * std_e) + mean_e
 
         true_energy = np.array([morse_potential(De, re, a, r) for r in r_test])
