@@ -20,7 +20,7 @@ from cuda_kernels import (
     get_apply_weights_biases_kernel,
     get_compute_delta_output_kernel,
     get_sum_delta_rows_kernel,
-    get_compute_ReLU_deriv_kernel,
+    get_compute_act_deriv_kernel,
     get_matrix_multiply_kernel,
     get_transpose_matrix_kernel,
 )
@@ -114,7 +114,7 @@ class Layer:
             self.apply_weights_biases = get_apply_weights_biases_kernel()
             self.compute_delta_output = get_compute_delta_output_kernel()
             self.sum_delta_rows = get_sum_delta_rows_kernel()
-            self.compute_ReLU_deriv = get_compute_ReLU_deriv_kernel()
+            self.compute_act_deriv = get_compute_act_deriv_kernel()
             self.matrix_multiply = get_matrix_multiply_kernel()
             self.transpose_matrix = get_transpose_matrix_kernel()
 
@@ -132,8 +132,13 @@ class Layer:
         if self.next_layer is None:  # Just do linear output
             self.activations = self.preactivations
         else:
-            # Apply the activation function
-            self.activations = np.maximum(0, self.preactivations)  # ReLU
+            # Apply the softplus activation function
+            # self.activations = np.maximum(0, self.preactivations)  # ReLU
+            self.activations = np.where(
+                self.preactivations > 20.0,
+                self.preactivations,
+                np.log(1.0 + np.exp(self.preactivations)),
+            )
 
     def ff_gpu(self):
         M = self.size
@@ -186,7 +191,9 @@ class Layer:
             self.delta = self.activations - reference
         else:  # Hidden layer
             # Get this from differentiating the activation function
-            activation_grad = np.where(self.preactivations > 0, 1.0, 0.0)  # ReLU
+            # Now differentiating the softplus (sigmoid)
+            # activation_grad = np.where(self.preactivations > 0, 1.0, 0.0)  # ReLU
+            activation_grad = 1.0 / (1.0 + np.exp(-self.preactivations))
             self.delta = (
                 np.dot(self.next_layer.weights.transpose(), self.next_layer.delta)
                 * activation_grad
@@ -244,7 +251,7 @@ class Layer:
             )
 
             # take ReLU deriv
-            self.compute_ReLU_deriv(
+            self.compute_act_deriv(
                 self.delta_temp_gpu,
                 self.preactivations_gpu,
                 self.biases_gpu,
@@ -576,8 +583,10 @@ class AB3:
         cos_sq_beta = np.clip((np.cos(theta) + 0.5) / 1.5, 0.0, 1.0)
         beta = np.arccos(np.sqrt(cos_sq_beta))
 
-        # slightly larger than evaluation scale of 0.8 to 2.0
-        scale = np.random.uniform(0.75, 2.1)
+        # set normal dist around equilibrium length
+        # clip slightly larger than evaluation scale of 0.8 to 2.0
+        scale = np.random.normal(1.0, 0.3)
+        scale = np.clip(scale, 0.75, 2.1)
 
         # get eq length from the base geometry
         A_atom = self.base_pos[0]

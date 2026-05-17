@@ -11,7 +11,7 @@ def get_add_bias_kernel():
         float *activations,
         int M,
         int N,
-        int relu) // 1 for true, 0 for false
+        int activation) // 1 for true, 0 for false
         {
 
         int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -22,13 +22,13 @@ def get_add_bias_kernel():
             int idx = row * N + col; 
             float val = preactivations[idx] + biases[row];
 
-            // apply ReLU if hidden layer
-            if (relu == 1){
-                if (val > 0.0f){
-                    activations[idx] = val; 
+            // apply softmax if hidden layer
+            if (activation == 1){
+                if (val > 20.0f){
+                    activations[idx] = val;
                 }
-                else {
-                    activations[idx] = 0.0f; 
+                else{
+                    activations[idx] = logf(1.0f + expf(val));
                 }
             }
             // on output layer, just keep vals as they are
@@ -93,7 +93,7 @@ def get_compute_delta_output_kernel():
     return cuda_module.get_function("compute_delta_output")
 
 
-def get_compute_ReLU_deriv_kernel():
+def get_compute_act_deriv_kernel():
     cuda_module = SourceModule(
         """
         __global__ void compute_ReLU_deriv(
@@ -110,11 +110,9 @@ def get_compute_ReLU_deriv_kernel():
             if (row < M && col < N){
                 int idx = row * N + col; 
                 float z = preactivations[idx] + biases[row];
-                if (z > 0.0f){
-                    delta[idx] = temp_delta[idx];
-                } else {
-                    delta[idx] = 0.0f; 
-                }
+                // Deriv of softplus is sigmoid function
+                float sigmoid = 1.0f / (1.0f + expf(-z));
+                delta[idx] = temp_delta[idx] * sigmoid;
             } 
         }
     """
