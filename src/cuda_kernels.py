@@ -60,7 +60,7 @@ def get_sum_delta_rows_kernel():
                 for (int col = 0; col < N; ++col){
                     sum += delta[row * N + col]; 
                 } 
-                biases_grad[row] = sum;
+                biases_grad[row] += sum;
             }
         }
         """
@@ -219,7 +219,7 @@ def get_matrix_multiply_kernel():
         __shared__ float B_share[TILE_SIZE][TILE_SIZE];
 
         // j * jstride + i * istride
-        float sum = 0.0;
+        float sum = 0.0f;
 
         // Need remainder guard here for non evenly divisible!!!!
         for (int ktile = 0; ktile < (K + TILE_SIZE - 1) / TILE_SIZE; ++ktile){

@@ -1,3 +1,4 @@
+import io
 import numpy as np
 import time
 import math
@@ -7,6 +8,9 @@ from pathlib import Path
 import sys
 import json
 import os
+
+from rdkit import Chem
+from rdkit.Chem import AllChem
 
 from pycuda import gpuarray
 import pycuda.autoinit
@@ -36,6 +40,9 @@ class InputLayer:
         self.device = device
         self.activations = np.zeros((self.size,), dtype=np.float32)
         if self.device == "gpu":
+            self.activations_gpu = gpuarray.zeros(
+                (self.size, batch_size), dtype=np.float32
+            )
             # Same layout as Layer.activations_transposed_gpu; used in bp_gpu on layer 1.
             self.activations_transposed_gpu = gpuarray.empty(
                 (batch_size, self.size), dtype=np.float32
@@ -163,9 +170,10 @@ class Layer:
             grid=(grid_x, grid_y, 1),
         )
 
-    def backpropagation(self, reference):
+    def backpropagation(self, reference, reference_gpu=None):
         if self.device == "gpu":
-            reference_gpu = gpuarray.to_gpu(reference)
+            if reference_gpu is None:
+                reference_gpu = gpuarray.to_gpu(reference)
             self.bp_gpu(reference_gpu)
         else:
             self.bp_cpu(reference)
@@ -207,9 +215,9 @@ class Layer:
         # Hidden layer
         else:
             M_next = self.next_layer.size
-            # transpose next layer's weights
-            grid_x = math.ceil(M_next / self.tile_size)
-            grid_y = math.ceil(M_curr / self.tile_size)
+            # transpose next layer's weights (kernel: x spans N=M_curr cols, y spans M=M_next rows)
+            grid_x = math.ceil(M_curr / self.tile_size)
+            grid_y = math.ceil(M_next / self.tile_size)
             self.transpose_matrix(
                 self.next_layer.weights_gpu,
                 self.next_layer.weights_transposed_gpu,
@@ -246,9 +254,9 @@ class Layer:
             )
 
         # For all layers calculate the gradients
-        # First transpose the previous layers activations
-        grid_x = math.ceil(M_prev / self.tile_size)
-        grid_y = math.ceil(N_batch / self.tile_size)
+        # First transpose the previous layers activations (kernel: x spans N_batch, y spans M_prev)
+        grid_x = math.ceil(N_batch / self.tile_size)
+        grid_y = math.ceil(M_prev / self.tile_size)
         self.transpose_matrix(
             self.previous_layer.activations_gpu,
             self.previous_layer.activations_transposed_gpu,
@@ -259,6 +267,7 @@ class Layer:
         )
 
         # Multiply the delta and transposed activations to get weights grad
+        self.weights_grad_gpu.fill(0)
         grid_x = math.ceil(M_prev / self.tile_size)
         grid_y = math.ceil(M_curr / self.tile_size)
         self.matrix_multiply(
@@ -272,7 +281,7 @@ class Layer:
             grid=(grid_x, grid_y, 1),
         )
 
-        # Sum across delta rows to get the biases grad
+        self.biases_grad_gpu.fill(0)
         grid_x = math.ceil(M_curr / self.tile_size)
         self.sum_delta_rows(
             self.delta_gpu,
@@ -324,7 +333,7 @@ class Network:
         self.device = device
         self.batch_size = batch_size
 
-        new_layer = InputLayer(1, batch_size, device)
+        new_layer = InputLayer(sizes[0], batch_size, device)
         self.layers.append(new_layer)
         for ilayer in range(1, len(sizes)):
             self.layers.append(
@@ -355,17 +364,21 @@ class Network:
                 for ilayer in range(1, len(self.layers)):
                     self.layers[ilayer].current_batch = current_batch
 
-                # Grab entire matrix of refs instead of one at a time
-                references = refs_shuffled[istart:iend].reshape(1, current_batch)
-                self.layers[0].activations = inputs_shuffled[istart:iend].reshape(
-                    1, current_batch
-                )
+                # shape -> (n_features, batch)
+                # Morse: 1 feature & AB3: 6 features.
+                batch_refs = refs_shuffled[istart:iend]
+                references = batch_refs.reshape(1, current_batch)
+                batch_inputs = inputs_shuffled[istart:iend]
+                if batch_inputs.ndim == 1:
+                    self.layers[0].activations = batch_inputs.reshape(1, current_batch)
+                else:
+                    self.layers[0].activations = batch_inputs.T.astype(np.float32)
 
-                # send activations to gpu if using that device
                 if self.device == "gpu":
-                    self.layers[0].activations_gpu = gpuarray.to_gpu(
-                        self.layers[0].activations
-                    )
+                    self.layers[0].activations_gpu.set(self.layers[0].activations)
+                    reference_gpu = gpuarray.to_gpu(references)
+                else:
+                    reference_gpu = None
 
                 # Feedforward through the other layers
                 start_time = time.time()
@@ -377,7 +390,7 @@ class Network:
                 # Do backpropagation
                 start_time = time.time()
                 for ilayer in range(len(self.layers) - 1):
-                    self.layers[-1 - ilayer].backpropagation(references)
+                    self.layers[-1 - ilayer].backpropagation(references, reference_gpu)
                 backpropagation_time += time.time() - start_time
 
                 # Calculate loss (after backprop: output delta = activations - reference)
@@ -386,10 +399,7 @@ class Network:
                     batch_loss_gpu = gpuarray.sum(squared_error_gpu)
                     loss += float(batch_loss_gpu.get())
                 else:
-                    for ilayer in range(1, len(self.layers)):
-                        loss += np.sum(
-                            (self.layers[ilayer].activations - references) ** 2
-                        )
+                    loss += np.sum((self.layers[-1].activations - references) ** 2)
 
                 for ilayer in range(1, len(self.layers)):
                     self.layers[ilayer].apply_gradient(current_batch, training_rate)
@@ -443,22 +453,27 @@ def morse_potential(De, re, a, r):
     return De * inner * inner
 
 
-def load_setup(filename):
+def load_setup(setup_path):
+    path = Path(setup_path)
+    if not path.is_file():
+        fallback = Path("setup") / path.name
+        if fallback.is_file():
+            path = fallback
+            print(
+                f"Note: use setup/{path.name} on the command line "
+                "(bare filename still accepted)"
+            )
+        else:
+            raise FileNotFoundError(f"Setup file not found: {setup_path}")
 
-    model_path = Path("setup")
-    model_path.mkdir(parents=True, exist_ok=True)
-    filepath = f"setup/{filename}"
+    Path("setup").mkdir(parents=True, exist_ok=True)
 
-    # Parse setup file
-    if os.path.exists(filepath):
-        with open(filepath, "r") as file:
-            try:
-                run_data = json.load(file)
-                print("Run setup json parsed successfully")
-            except json.JSONDecodeError:
-                print("Error: file found but could not be parsed")
-    else:
-        raise FileNotFoundError(f"File not found: {filepath}")
+    with open(path, "r") as file:
+        try:
+            run_data = json.load(file)
+            print(f"Run setup parsed: {path}")
+        except json.JSONDecodeError as err:
+            raise ValueError(f"Could not parse setup JSON: {path}") from err
 
     required = {
         "run",
@@ -516,18 +531,188 @@ class Morse:
         )
         return r_test, r_test_norm, true_energy
 
+    def eval_curves(self, n_test=300):
+        x, x_norm, true_e = self.eval_grid(n_test)
+        yield "default", x, x_norm, true_e  # x_norm is (1, n_test)
 
-def train_AB3(): ...
+
+class AB3:
+    def __init__(self):
+        # Using NH3 as model AB3 mol for training
+        self.mol = Chem.MolFromSmiles("N")
+        self.mol = Chem.AddHs(self.mol)
+
+        # Setup the Merck molecular force field properties
+        self.mp = AllChem.MMFFGetMoleculeProperties(self.mol)
+
+        # 3D coordinates do not exist until after embedding (GetConformer fails before this).
+        params = AllChem.ETKDGv3()
+        if AllChem.EmbedMolecule(self.mol, params) != 0:
+            raise RuntimeError("RDKit failed to embed NH3 3D geometry")
+
+        self.conf = self.mol.GetConformer()
+        self.base_pos = np.array(self.conf.GetPositions(), dtype=np.float64)
+
+    def perturb_structure(self):
+        # perturb from 0 to 0.15 angstroms for all positions
+        perturbation = np.random.normal(0, 0.15, self.base_pos.shape)
+        new_pos = self.base_pos + perturbation
+        self.conf.SetPositions(new_pos)
+
+    def get_ff_energy(self):
+        ff = AllChem.MMFFGetMoleculeForceField(self.mol, self.mp)
+        return ff.CalcEnergy()
+
+    def training_data(self, ninputs):
+        energies = np.zeros(ninputs)
+        coords = np.zeros((ninputs, self.mol.GetNumAtoms(), 3))
+
+        for i in range(ninputs):
+            self.perturb_structure()
+            energy = self.get_ff_energy()
+            energies[i] = energy
+            coords[i] = self.conf.GetPositions()
+
+        # Generate all pairwise bond lengths
+        A_atom = coords[:, 0:1, :]
+        B_atoms = coords[:, 1:, :]
+
+        bond_vecs = B_atoms - A_atom
+        lengths = np.linalg.norm(bond_vecs, axis=-1)
+
+        # Generate all pairwise bond angles
+        norm_vecs = bond_vecs / lengths[:, :, np.newaxis]
+        dot_B1_A_B2 = np.sum(norm_vecs[:, 0, :] * norm_vecs[:, 1, :], axis=-1)
+        dot_B1_A_B3 = np.sum(norm_vecs[:, 0, :] * norm_vecs[:, 2, :], axis=-1)
+        dot_B2_A_B3 = np.sum(norm_vecs[:, 1, :] * norm_vecs[:, 2, :], axis=-1)
+
+        dots = np.stack([dot_B1_A_B2, dot_B1_A_B3, dot_B2_A_B3], axis=-1)
+        angles = np.arccos(np.clip(dots, -1.0, 1.0))
+
+        # combine lenghts and angles into flat features for model
+        features = np.concatenate([lengths, angles], axis=-1)
+
+        mean_e, std_e = energies.mean(), energies.std()
+        targets = (energies - mean_e) / std_e
+        norm = {"mean_e": mean_e, "std_e": std_e}
+
+        return features.astype(np.float32), targets.astype(np.float32), norm
+
+    def eval_symmetric_stretch(self, n_test=300):
+        # Stretching scale (80% to 200%)
+        scales = np.linspace(0.8, 2.0, n_test)
+
+        true_energies = np.zeros(n_test, dtype=np.float32)
+        features = np.zeros((n_test, 6), dtype=np.float32)
+
+        # Get length and angle components from base geometry
+        A_atom = self.base_pos[0:1, :]
+        B_atoms = self.base_pos[1:, :]
+        base_bond_vecs = B_atoms - A_atom
+        base_lengths = np.linalg.norm(base_bond_vecs, axis=-1)
+        norm_vecs = base_bond_vecs / base_lengths[:, np.newaxis]
+
+        dot_B1_A_B2 = np.sum(norm_vecs[0] * norm_vecs[1])
+        dot_B1_A_B3 = np.sum(norm_vecs[0] * norm_vecs[2])
+        dot_B2_A_B3 = np.sum(norm_vecs[1] * norm_vecs[2])
+        base_angles = np.arccos(
+            np.clip([dot_B1_A_B2, dot_B1_A_B3, dot_B2_A_B3], -1.0, 1.0)
+        )
+
+        for i, scale in enumerate(scales):
+            new_vecs = base_bond_vecs * scale
+            new_pos = np.vstack([A_atom, A_atom + new_vecs])
+
+            # Calc true energy from stretched mol
+            self.conf.SetPositions(new_pos)
+            true_energies[i] = self.get_ff_energy()
+
+            # Build the features for net
+            current_lengths = base_lengths * scale
+            features[i] = np.concatenate([current_lengths, base_angles])
+
+        return scales, features, true_energies
+
+    def eval_symmetric_bend(self, n_test=300):
+        # Strategy is to keep B-atoms in a ring spaced 120deg apart
+        # Change the angle that the ring is relative to the central A atom
+        # Should find optimal A-B angle this way
+
+        # Evaluating angles from 90 to 120 degrees
+        angles_deg = np.linspace(90, 120, n_test)
+        angles_rad = np.radians(angles_deg)
+
+        true_energies = np.zeros(n_test, dtype=np.float32)
+        features = np.zeros((n_test, 6), dtype=np.float32)
+
+        # Get equilibrium bond length from base geometry
+        A_atom = self.base_pos[0]
+        B_atoms = self.base_pos[1:]
+        eq_length = np.mean(np.linalg.norm(B_atoms - A_atom, axis=-1))
+
+        # Angles for B-atoms spaced 120 degrees apart
+        phi = np.radians([0, 120, 240])
+
+        for i, theta in enumerate(angles_rad):
+            # Target B-A-B bond angle is related to beta by:
+            # cos^2(Beta) = cos(theta) + 0.5 / 1.5
+            cos_sq_beta = (np.cos(theta) + 0.5) / 1.5
+            cos_sq_beta = np.clip(cos_sq_beta, 0.0, 1.0)
+            # sqrt previous term to reveal beta
+            beta = np.arccos(np.sqrt(cos_sq_beta))
+
+            # generate the new B atom coords
+            # A atom stays fixed at 0,0,0
+            new_pos = np.zeros((4, 3))
+            new_pos[1:, 0] = eq_length * np.sin(beta) * np.cos(phi)  # X
+            new_pos[1:, 1] = eq_length * np.sin(beta) * np.sin(phi)  # Y
+            new_pos[1:, 2] = eq_length * np.cos(beta)  # Z
+
+            # Get true energy using these new coords
+            self.conf.SetPositions(new_pos)
+            true_energies[i] = self.get_ff_energy()
+
+            lengths = np.array([eq_length, eq_length, eq_length])
+            angles = np.array([theta, theta, theta])
+            features[i] = np.concatenate([lengths, angles])
+
+        return angles_deg, features, true_energies
+
+    def evaluations(self):
+        return {
+            "stretch": self.eval_symmetric_stretch,
+            "bend": self.eval_symmetric_bend,
+        }
+
+    def eval_curves(self, n_test=300):
+        for name, func in self.evaluations().items():
+            x, features, true_e = func(n_test)
+            yield name, x, features, true_e
 
 
-def eval_AB3(): ...
+def predict_curve(net, inputs, n_test, norm):
+    inputs = np.ascontiguousarray(inputs, dtype=np.float32)
+    for layer in net.layers:
+        layer.current_batch = n_test
+    for layer in net.layers[1:]:
+        layer.device = "cpu"
+
+    net.layers[0].activations = inputs
+    for ilayer in range(1, len(net.layers)):
+        net.layers[ilayer].feedforward()
+
+    pred_norm = net.layers[-1].activations[0, :n_test]
+    return pred_norm * norm["std_e"] + norm["mean_e"]
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train or evaluate neural net")
 
-    parser.add_argument("run", help="Name of setup run.json to train or evaluate")
+    parser.add_argument(
+        "setup",
+        help="Path to setup JSON (e.g. setup/ab3_basic.json)",
+    )
 
     # Run mode (train or evaluate)
     parser.add_argument(
@@ -537,14 +722,19 @@ if __name__ == "__main__":
         "-e", "--eval", action="store_true", help="Set model to evaluate"
     )
 
-    # Device mode (CPU or GPU)
+    # Device mode (CPU or GPU) for training
     parser.add_argument("--cpu", action="store_true", help="Sets device to CPU")
     parser.add_argument("--gpu", action="store_true", help="Sets device to GPU")
+    parser.add_argument(
+        "--weights",
+        default=None,
+        help="Checkpoint .npz path (default: models/{run}_{device}.npz)",
+    )
 
     args = parser.parse_args()
 
     # Extract values and ensure that requirements are met
-    data = load_setup(args.run)
+    data = load_setup(args.setup)
     run = data["run"]
     problem = data["problem"]
     ninputs = data["ninputs"]
@@ -568,10 +758,11 @@ if __name__ == "__main__":
         device = "cpu"  # cpu by default
         print("Running on default device = CPU")
 
-    # Create full file name from models directory
+    # Checkpoint path (device suffix only names the default file for train/save)
     model_path = Path("models")
     model_path.mkdir(parents=True, exist_ok=True)
-    filename = f"models/{run}_{device}.npz"
+    filename = args.weights or f"models/{run}_{device}.npz"
+    checkpoint_label = Path(filename).stem
 
     # Train the model
     if args.train:
@@ -579,13 +770,13 @@ if __name__ == "__main__":
 
         if problem == "Morse":
             problem_obj = Morse()
-            r_norm, e_norm, norm = problem_obj.training_data(ninputs)
         elif problem == "AB3":
-            ...
+            problem_obj = AB3()
         else:
             raise ValueError(f"Problem type not recognized: {problem}")
 
-        net = Network(architecture, r_norm, e_norm, batch_size, device)
+        inputs, refs, norm = problem_obj.training_data(ninputs)
+        net = Network(architecture, inputs, refs, batch_size, device)
         start_time = time.time()
         net.train(epochs, training_rate)
         print(f"Training time: {time.time() - start_time}")
@@ -597,19 +788,21 @@ if __name__ == "__main__":
         n_test = 300
         if problem == "Morse":
             problem_obj = Morse()
-            r_test, r_test_norm, true_energy = problem_obj.eval_grid(n_test)
         elif problem == "AB3":
-            ...
+            problem_obj = AB3()
         else:
             raise ValueError(f"Problem type not recognized: {problem}")
 
+        # Eval always runs forward on CPU; weights in .npz are device-agnostic.
+        print(f"Loading checkpoint: {filename}")
         net_batch = max(batch_size, n_test)
+        n_features = architecture[0]
         net = Network(
             architecture,
-            np.zeros((1, n_test), dtype=np.float32),
-            np.zeros((1, n_test), dtype=np.float32),
+            np.zeros((n_test, n_features), dtype=np.float32),
+            np.zeros(n_test, dtype=np.float32),
             net_batch,
-            device,
+            "cpu",
         )
         norm = net.load_weights(filename)
         if norm is None:
@@ -617,29 +810,43 @@ if __name__ == "__main__":
                 f"Missing mean_e/std_e in {filename}; retrain with current code."
             )
 
-        # perform forward pass through trained net
-        for layer in net.layers:
-            layer.current_batch = n_test
-        net.layers[0].activations = r_test_norm
-        if net.device == "gpu":
-            net.layers[0].activations_gpu = gpuarray.to_gpu(net.layers[0].activations)
-        for ilayer in range(1, len(net.layers)):
-            net.layers[ilayer].feedforward()
+        for name, x, features, true_e in problem_obj.eval_curves(n_test):
+            # Network expects (n_features, n_test)
+            if features.ndim == 1:
+                inputs = features.reshape(1, n_test)
+            elif features.shape[0] == n_test:
+                inputs = features.T.astype(np.float32)
+            else:
+                inputs = np.ascontiguousarray(features, dtype=np.float32)
 
-        if net.device == "gpu":
-            pred_e_norm = np.asarray(net.layers[-1].activations_gpu.get())[0, :n_test]
-        else:
-            pred_e_norm = net.layers[-1].activations[0, :n_test]
-        pred_energy = (pred_e_norm * norm["std_e"]) + norm["mean_e"]
+            # generate prediction curves
+            pred_e = predict_curve(net, inputs, n_test, norm)
+            rmse = np.sqrt(np.mean((true_e - pred_e) ** 2))
 
-        plt.plot(r_test, true_energy, label="true")
-        plt.plot(r_test, pred_energy, label="pred")
-        plt.legend()
+            plt.clf()
+            plt.plot(x, true_e, label="true")
+            plt.plot(x, pred_e, label="pred")
 
-        plot_path = Path("plots")
-        plot_path.mkdir(parents=True, exist_ok=True)
-        plot_name = plot_path / f"{run}_{device}.png"
-        plt.savefig(plot_name)
+            if name == "stretch" or name == "bend":
+                y_units = "kcal/mol"
+            else:
+                y_units = "eV"
+
+            if name == "stretch" or name == "default":
+                x_units = "Angstroms"
+            else:
+                x_units = "Degrees"
+
+            plt.title(f"{checkpoint_label} {name}\nRMSE: {rmse}")
+            plt.xlabel(x_units)
+            plt.ylabel(f"Energy ({y_units})")
+            plt.legend()
+
+            plot_path = Path("plots")
+            plot_path.mkdir(parents=True, exist_ok=True)
+            plot_name = plot_path / f"{checkpoint_label}_{name}.png"
+            plt.savefig(plot_name)
+            plt.close()
 
     # User did not specify a run mode, exit safely
     else:
