@@ -1,0 +1,16 @@
+{
+    "run": "ab3_131072_ninputs_128_128_64_32_hl_0005_lr_5000_epoch",
+    "problem": "AB3",
+    "ninputs": 131072,
+    "batch_size": 4096,
+    "epochs": 5000,
+    "training_rate": 0.0005,
+    "architecture": [
+        6,
+        128,
+        128,
+        64,
+        32,
+        1
+    ]
+}

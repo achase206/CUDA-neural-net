@@ -32,6 +32,8 @@ from cuda_kernels import (
 #   Allow a json file to specify the net layers
 #   Complete discussion of results
 
+np.random.seed(42)
+
 
 class InputLayer:
     def __init__(self, size, batch_size, device):
@@ -372,7 +374,8 @@ class Network:
                 if batch_inputs.ndim == 1:
                     self.layers[0].activations = batch_inputs.reshape(1, current_batch)
                 else:
-                    self.layers[0].activations = batch_inputs.T.astype(np.float32)
+                    transposed_inputs = batch_inputs.T.astype(np.float32)
+                    self.layers[0].activations = np.ascontiguousarray(transposed_inputs)
 
                 if self.device == "gpu":
                     self.layers[0].activations_gpu.set(self.layers[0].activations)
@@ -554,10 +557,43 @@ class AB3:
         self.base_pos = np.array(self.conf.GetPositions(), dtype=np.float64)
 
     def perturb_structure(self):
-        # perturb from 0 to 0.15 angstroms for all positions
-        perturbation = np.random.normal(0, 0.15, self.base_pos.shape)
-        new_pos = self.base_pos + perturbation
-        self.conf.SetPositions(new_pos)
+        # scale = np.random.uniform(0.75, 2.1)
+        # A_atom = self.base_pos[0:1, :]
+        # B_atoms = self.base_pos[1:, :]
+        # base_bond_vecs = B_atoms - A_atom
+
+        # # apply random scale ot the bond vecs
+        # scaled_B_atoms = A_atom + (base_bond_vecs * scale)
+        # scaled_pos = np.vstack([A_atom, scaled_B_atoms])
+
+        # # perturb from 0 to 0.15 angstroms for all positions
+        # perturbation = np.random.normal(0, 0.15, scaled_pos.shape)
+        # new_pos = scaled_pos + perturbation
+        # self.conf.SetPositions(new_pos)
+
+        # generate some random angles for training
+        theta = np.random.uniform(np.radians(85), np.radians(125))
+        cos_sq_beta = np.clip((np.cos(theta) + 0.5) / 1.5, 0.0, 1.0)
+        beta = np.arccos(np.sqrt(cos_sq_beta))
+
+        # slightly larger than evaluation scale of 0.8 to 2.0
+        scale = np.random.uniform(0.75, 2.1)
+
+        # get eq length from the base geometry
+        A_atom = self.base_pos[0]
+        B_atoms = self.base_pos[1:]
+        eq_length = np.mean(np.linalg.norm(B_atoms - A_atom, axis=-1))
+        r = eq_length * scale
+
+        # build synthetic base coords to then perturb
+        new_pos = np.zeros((4, 3))
+        phi = np.radians([0, 120, 240])
+        new_pos[1:, 0] = r * np.sin(beta) * np.cos(phi)
+        new_pos[1:, 1] = r * np.sin(beta) * np.sin(phi)
+        new_pos[1:, 2] = r * np.cos(beta)
+
+        perturbation = np.random.normal(0, 0.05, new_pos.shape)
+        self.conf.SetPositions(new_pos + perturbation)
 
     def get_ff_energy(self):
         ff = AllChem.MMFFGetMoleculeForceField(self.mol, self.mp)

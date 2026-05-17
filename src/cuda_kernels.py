@@ -173,13 +173,13 @@ def get_apply_weights_biases_kernel():
             // Apply weights and biases with training rate
             if (row < M && col < K){
                 int idx = row * K + col;
-                float weight_diff = (training_rate / batch_size) * weights_grad[idx];
+                float weight_diff = (training_rate / (float)batch_size) * weights_grad[idx];
                 weights[idx] = weights[idx] - weight_diff;
                 weights_grad[idx] = 0.0f;
 
                 // Biases is 1D vec, only update on first column thread
                 if (col == 0){
-                    float bias_diff = (training_rate / batch_size) * biases_grad[row];
+                    float bias_diff = (training_rate / (float)batch_size) * biases_grad[row];
                     biases[row] = biases[row] - bias_diff;
                     biases_grad[row] = 0.0f;
                 }
