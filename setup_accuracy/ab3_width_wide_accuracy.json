@@ -1,0 +1,16 @@
+{
+    "run": "ab3_width_wide_accuracy",
+    "problem": "AB3",
+    "ninputs": 131072,
+    "batch_size": 131072,
+    "epochs": 5000,
+    "training_rate": 0.0005,
+    "architecture": [
+        6,
+        512,
+        512,
+        256,
+        128,
+        1
+    ]
+}

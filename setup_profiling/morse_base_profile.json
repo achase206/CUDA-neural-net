@@ -1,0 +1,14 @@
+{
+    "run": "morse_base_profile",
+    "problem": "Morse",
+    "ninputs": 131072,
+    "batch_size": 4096,
+    "epochs": 20,
+    "training_rate": 0.05,
+    "architecture": [
+        1,
+        16,
+        16,
+        1
+    ]
+}

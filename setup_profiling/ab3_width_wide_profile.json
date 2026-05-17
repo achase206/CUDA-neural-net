@@ -1,0 +1,16 @@
+{
+    "run": "ab3_width_wide_profile",
+    "problem": "AB3",
+    "ninputs": 131072,
+    "batch_size": 4096,
+    "epochs": 20,
+    "training_rate": 0.0005,
+    "architecture": [
+        6,
+        512,
+        512,
+        256,
+        128,
+        1
+    ]
+}

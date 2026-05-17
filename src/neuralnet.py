@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import json
 import os
+from tqdm import tqdm
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -358,7 +359,8 @@ class Network:
         ninputs = len(self.training_inputs)
         feedforward_time = 0.0
         backpropagation_time = 0.0
-        for iepoch in range(nepochs):
+        pbar = tqdm(range(nepochs), desc="Training")
+        for iepoch in pbar:
             loss = 0.0
             indices = np.random.permutation(ninputs)
             inputs_shuffled = self.training_inputs[indices]
@@ -415,7 +417,7 @@ class Network:
                     self.layers[ilayer].apply_gradient(current_batch, training_rate)
 
             standard_deviation = math.sqrt(loss / ninputs)
-            print(f"Epoch, deviation: {iepoch}, {standard_deviation}")
+            pbar.set_postfix(loss=f"{standard_deviation:.6f}", refresh=True)
 
         print(f"Feedforward time: {feedforward_time}")
         print(f"Backpropagation time: {backpropagation_time}")
@@ -433,6 +435,10 @@ class Network:
         if norm is not None:
             model_dict["mean_e"] = np.float32(norm["mean_e"])
             model_dict["std_e"] = np.float32(norm["std_e"])
+            # AB3 z-scores features; Morse uses fixed _normalize_r (no mean_f/std_f).
+            if "mean_f" in norm and "std_f" in norm:
+                model_dict["mean_f"] = norm["mean_f"]
+                model_dict["std_f"] = norm["std_f"]
 
         # np.savez stores multiple arrays into single file
         np.savez_compressed(filename, **model_dict)
@@ -454,6 +460,9 @@ class Network:
                     "mean_e": float(model["mean_e"]),
                     "std_e": float(model["std_e"]),
                 }
+                if "mean_f" in model and "std_f" in model:
+                    norm["mean_f"] = model["mean_f"]
+                    norm["std_f"] = model["std_f"]
         print(f"Model weights loaded from {filename}")
         return norm
 
@@ -564,19 +573,6 @@ class AB3:
         self.base_pos = np.array(self.conf.GetPositions(), dtype=np.float64)
 
     def perturb_structure(self):
-        # scale = np.random.uniform(0.75, 2.1)
-        # A_atom = self.base_pos[0:1, :]
-        # B_atoms = self.base_pos[1:, :]
-        # base_bond_vecs = B_atoms - A_atom
-
-        # # apply random scale ot the bond vecs
-        # scaled_B_atoms = A_atom + (base_bond_vecs * scale)
-        # scaled_pos = np.vstack([A_atom, scaled_B_atoms])
-
-        # # perturb from 0 to 0.15 angstroms for all positions
-        # perturbation = np.random.normal(0, 0.15, scaled_pos.shape)
-        # new_pos = scaled_pos + perturbation
-        # self.conf.SetPositions(new_pos)
 
         # generate some random angles for training
         theta = np.random.uniform(np.radians(85), np.radians(125))
@@ -585,8 +581,8 @@ class AB3:
 
         # set normal dist around equilibrium length
         # clip slightly larger than evaluation scale of 0.8 to 2.0
-        scale = np.random.normal(1.0, 0.3)
-        scale = np.clip(scale, 0.75, 2.1)
+        scale = np.random.normal(1.0, 0.1)
+        scale = np.clip(scale, 0.85, 1.3)
 
         # get eq length from the base geometry
         A_atom = self.base_pos[0]
@@ -601,8 +597,13 @@ class AB3:
         new_pos[1:, 1] = r * np.sin(beta) * np.sin(phi)
         new_pos[1:, 2] = r * np.cos(beta)
 
-        perturbation = np.random.normal(0, 0.05, new_pos.shape)
-        self.conf.SetPositions(new_pos + perturbation)
+        # Only apply noise for 80% of samples
+        # Leaves more "real" conformers near extremes
+        if np.random.rand() < 0.8:
+            perturbation = np.random.normal(0, 0.05, new_pos.shape)
+            new_pos = new_pos + perturbation
+
+        self.conf.SetPositions(new_pos)
 
     def get_ff_energy(self):
         ff = AllChem.MMFFGetMoleculeForceField(self.mol, self.mp)
@@ -637,15 +638,21 @@ class AB3:
         # combine lenghts and angles into flat features for model
         features = np.concatenate([lengths, angles], axis=-1)
 
+        # standardize input features
+        mean_f = features.mean(axis=0)
+        std_f = features.std(axis=0)
+        features = (features - mean_f) / std_f
+
         mean_e, std_e = energies.mean(), energies.std()
         targets = (energies - mean_e) / std_e
-        norm = {"mean_e": mean_e, "std_e": std_e}
+
+        norm = {"mean_e": mean_e, "std_e": std_e, "mean_f": mean_f, "std_f": std_f}
 
         return features.astype(np.float32), targets.astype(np.float32), norm
 
     def eval_symmetric_stretch(self, n_test=300):
         # Stretching scale (80% to 200%)
-        scales = np.linspace(0.8, 2.0, n_test)
+        scales = np.linspace(0.8, 1.3, n_test)
 
         true_energies = np.zeros(n_test, dtype=np.float32)
         features = np.zeros((n_test, 6), dtype=np.float32)
@@ -863,6 +870,12 @@ if __name__ == "__main__":
                 inputs = features.T.astype(np.float32)
             else:
                 inputs = np.ascontiguousarray(features, dtype=np.float32)
+
+            # AB3: z-score eval features with training stats. Morse: already normalized in eval_curves.
+            if "mean_f" in norm and "std_f" in norm:
+                inputs = (inputs - norm["mean_f"][:, np.newaxis]) / norm["std_f"][
+                    :, np.newaxis
+                ]
 
             # generate prediction curves
             pred_e = predict_curve(net, inputs, n_test, norm)

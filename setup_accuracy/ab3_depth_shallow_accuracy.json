@@ -1,0 +1,14 @@
+{
+    "run": "ab3_depth_shallow_accuracy",
+    "problem": "AB3",
+    "ninputs": 131072,
+    "batch_size": 131072,
+    "epochs": 5000,
+    "training_rate": 0.0005,
+    "architecture": [
+        6,
+        128,
+        64,
+        1
+    ]
+}
