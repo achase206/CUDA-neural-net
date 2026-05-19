@@ -193,10 +193,6 @@ def get_apply_weights_biases_kernel():
 def get_matrix_multiply_kernel():
     cuda_module = SourceModule(
         """
-    // Additional kernels to implement
-    // Add bias column vec to preactivation matrix and apply ReLU
-    // Compute derivative of the ReLU for the hidden layer delta calc
-    // Apply weight/bias gradients using the training rate
 
     #define TILE_SIZE 32
     // M = rows of A and C

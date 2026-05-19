@@ -1,3 +1,5 @@
+"""Train and evaluate neural networks for Morse and AB3 energy surfaces."""
+
 import io
 import numpy as np
 import time
@@ -37,7 +39,16 @@ np.random.seed(42)
 
 
 class InputLayer:
+    """Holds input activations for one batch (no learnable weights)."""
+
     def __init__(self, size, batch_size, device):
+        """Create the input layer.
+
+        Args:
+            size: Number of input features.
+            batch_size: Maximum batch size for GPU buffers.
+            device: ``"cpu"`` or ``"gpu"``.
+        """
         self.size = size
         self.current_batch = batch_size
         self.device = device
@@ -53,7 +64,17 @@ class InputLayer:
 
 
 class Layer:
+    """One fully connected layer with CPU or CUDA forward/backward passes."""
+
     def __init__(self, size, previous_layer, batch_size, device):
+        """Build a layer and link it to the previous layer.
+
+        Args:
+            size: Number of neurons in this layer.
+            previous_layer: Layer or InputLayer below this one.
+            batch_size: Maximum batch size for GPU buffers.
+            device: ``"cpu"`` or ``"gpu"``.
+        """
         self.size = size
         self.previous_layer = previous_layer
         self.next_layer = None
@@ -120,12 +141,14 @@ class Layer:
             self.transpose_matrix = get_transpose_matrix_kernel()
 
     def feedforward(self):
+        """Run forward pass on CPU or GPU."""
         if self.device == "gpu":
             self.ff_gpu()
         else:
             self.ff_cpu()
 
     def ff_cpu(self):
+        """Forward pass using NumPy (softplus on hidden layers, linear output)."""
         self.preactivations = (
             np.dot(self.weights, self.previous_layer.activations) + self.biases
         )
@@ -142,6 +165,7 @@ class Layer:
             )
 
     def ff_gpu(self):
+        """Forward pass using CUDA kernels."""
         M = self.size
         N = self.previous_layer.current_batch
         K = self.previous_layer.size
@@ -179,6 +203,12 @@ class Layer:
         )
 
     def backpropagation(self, reference, reference_gpu=None):
+        """Compute deltas and weight/bias gradients for this layer.
+
+        Args:
+            reference: Target values for the output layer, shape ``(1, batch)``.
+            reference_gpu: Optional GPU copy of ``reference`` (GPU training only).
+        """
         if self.device == "gpu":
             if reference_gpu is None:
                 reference_gpu = gpuarray.to_gpu(reference)
@@ -187,6 +217,7 @@ class Layer:
             self.bp_cpu(reference)
 
     def bp_cpu(self, reference):
+        """Backprop on CPU; accumulates into ``weights_grad`` and ``biases_grad``."""
         if self.next_layer is None:  # Output layer
             # Get this from differentiating the cost function
             self.delta = self.activations - reference
@@ -204,6 +235,7 @@ class Layer:
         self.weights_grad += np.dot(self.delta, self.previous_layer.activations.T)
 
     def bp_gpu(self, reference):
+        """Backprop on GPU; accumulates into GPU gradient buffers."""
         M_prev = self.previous_layer.size
         M_curr = self.size
         N_batch = self.current_batch
@@ -303,18 +335,26 @@ class Layer:
         )
 
     def apply_gradient(self, batch_size, training_rate):
+        """Apply accumulated gradients to weights and biases.
+
+        Args:
+            batch_size: Batch size used to scale the learning rate.
+            training_rate: Learning rate from the setup file.
+        """
         if self.device == "gpu":
             self.grad_gpu(batch_size, training_rate)
         else:
             self.grad_cpu(batch_size, training_rate)
 
     def grad_cpu(self, batch_size, training_rate):
+        """Update CPU weights/biases and clear gradient buffers."""
         self.weights = self.weights - (training_rate / batch_size) * self.weights_grad
         self.biases = self.biases - (training_rate / batch_size) * self.biases_grad
         self.weights_grad.fill(0.0)
         self.biases_grad.fill(0.0)
 
     def grad_gpu(self, batch_size, training_rate):
+        """Update GPU weights/biases and clear gradient buffers."""
         M = self.size
         K = self.previous_layer.size
 
@@ -336,7 +376,18 @@ class Layer:
 
 
 class Network:
+    """Feedforward network built from an input layer and a stack of ``Layer`` objects."""
+
     def __init__(self, sizes, training_inputs, training_references, batch_size, device):
+        """Wire up layers from a list of layer sizes.
+
+        Args:
+            sizes: Layer widths, e.g. ``[6, 128, 64, 1]`` (input size first).
+            training_inputs: Training inputs (problem-specific layout).
+            training_references: Training targets aligned with inputs.
+            batch_size: Mini-batch size for training.
+            device: ``"cpu"`` or ``"gpu"``.
+        """
         self.layers = []
         self.training_inputs = training_inputs
         self.training_references = training_references
@@ -351,7 +402,12 @@ class Network:
             )
 
     def train(self, nepochs, training_rate):
+        """Train with shuffled mini-batches and print timing at the end.
 
+        Args:
+            nepochs: Number of passes over the training set.
+            training_rate: Learning rate from the setup file.
+        """
         # Only pass from CPU to GPU twice per batch
         # current inputs/references to GPU
         # send back loss to cpu for each batch
@@ -423,6 +479,12 @@ class Network:
         print(f"Backpropagation time: {backpropagation_time}")
 
     def save_weights(self, filename, norm=None):
+        """Save layer weights/biases and optional normalization stats to ``.npz``.
+
+        Args:
+            filename: Output path (e.g. ``models/my_run_gpu.npz``).
+            norm: Optional dict with ``mean_e``, ``std_e``, and maybe ``mean_f``, ``std_f``.
+        """
         model_dict = {}
         # Starting after input layer, save weights/biases
         for i, layer in enumerate(self.layers[1:]):
@@ -445,6 +507,14 @@ class Network:
         print(f"Model saved to {filename}")
 
     def load_weights(self, filename):
+        """Load weights/biases into layers (and GPU buffers if needed).
+
+        Args:
+            filename: Path to a checkpoint from ``save_weights``.
+
+        Returns:
+            Normalization dict if present in the file, else ``None``.
+        """
         with np.load(filename) as model:
             for i, layer in enumerate(self.layers[1:]):
                 layer.weights = np.asarray(
@@ -468,11 +538,30 @@ class Network:
 
 
 def morse_potential(De, re, a, r):
+    """Morse potential energy at bond length ``r``.
+
+    Args:
+        De: Well depth.
+        re: Equilibrium bond length.
+        a: Width parameter.
+        r: Bond length.
+
+    Returns:
+        Energy (same units as ``De``).
+    """
     inner = 1.0 - math.exp(-a * (r - re))
     return De * inner * inner
 
 
 def load_setup(setup_path):
+    """Load and validate a run configuration JSON file.
+
+    Args:
+        setup_path: Path to a setup file (e.g. ``setup/ab3_basic.json``).
+
+    Returns:
+        Dict with keys like ``run``, ``problem``, ``architecture``, etc.
+    """
     path = Path(setup_path)
     if not path.is_file():
         fallback = Path("setup") / path.name
@@ -512,7 +601,10 @@ def load_setup(setup_path):
 
 
 class Morse:
+    """1D Morse potential problem: bond length in, energy out."""
+
     def __init__(self):
+        """Set default Morse parameters and r sampling range."""
         self.De = 1.0
         self.re = 1.0
         self.a = 1.0
@@ -520,11 +612,21 @@ class Morse:
         self.max_rvalue = 2.0
 
     def _normalize_r(self, rvalues):
+        """Map bond lengths to roughly [-0.5, 0.5] over the training range."""
         return (rvalues - (self.max_rvalue + self.min_rvalue) / 2.0) / (
             self.max_rvalue - self.min_rvalue
         )
 
     def training_data(self, ninputs):
+        """Build random training pairs for the Morse curve.
+
+        Args:
+            ninputs: Number of training samples.
+
+        Returns:
+            Tuple ``(inputs, targets, norm)`` with normalized r, z-scored energy,
+            and ``norm`` containing ``mean_e`` / ``std_e``.
+        """
         rvalues = np.random.uniform(
             self.min_rvalue, self.max_rvalue, (ninputs,)
         ).astype(np.float32)
@@ -541,7 +643,14 @@ class Morse:
         )
 
     def eval_grid(self, n_test=300):
-        """Sorted r grid for plotting (not the random training set)."""
+        """Evenly spaced r values for plotting (not the random training set).
+
+        Args:
+            n_test: Number of points along the curve.
+
+        Returns:
+            Tuple ``(r, r_norm, true_energy)`` with ``r_norm`` shape ``(1, n_test)``.
+        """
         r_test = np.linspace(self.min_rvalue, self.max_rvalue, n_test, dtype=np.float32)
         r_test_norm = self._normalize_r(r_test).reshape(1, n_test)
         true_energy = np.array(
@@ -551,12 +660,20 @@ class Morse:
         return r_test, r_test_norm, true_energy
 
     def eval_curves(self, n_test=300):
+        """Yield one evaluation curve for plotting.
+
+        Yields:
+            ``(name, x, features, true_energy)`` with ``name`` ``"default"``.
+        """
         x, x_norm, true_e = self.eval_grid(n_test)
         yield "default", x, x_norm, true_e  # x_norm is (1, n_test)
 
 
 class AB3:
+    """NH3-style AB3 molecule: bond lengths and angles in, MMFF energy out."""
+
     def __init__(self):
+        """Embed NH3 and prepare the MMFF force field."""
         # Using NH3 as model AB3 mol for training
         self.mol = Chem.MolFromSmiles("N")
         self.mol = Chem.AddHs(self.mol)
@@ -573,7 +690,7 @@ class AB3:
         self.base_pos = np.array(self.conf.GetPositions(), dtype=np.float64)
 
     def perturb_structure(self):
-
+        """Randomize geometry and update the RDKit conformer in place."""
         # generate some random angles for training
         theta = np.random.uniform(np.radians(85), np.radians(125))
         cos_sq_beta = np.clip((np.cos(theta) + 0.5) / 1.5, 0.0, 1.0)
@@ -606,10 +723,24 @@ class AB3:
         self.conf.SetPositions(new_pos)
 
     def get_ff_energy(self):
+        """Return MMFF energy for the current conformer.
+
+        Returns:
+            Energy in kcal/mol.
+        """
         ff = AllChem.MMFFGetMoleculeForceField(self.mol, self.mp)
         return ff.CalcEnergy()
 
     def training_data(self, ninputs):
+        """Generate perturbed structures and build normalized training features.
+
+        Args:
+            ninputs: Number of training conformers.
+
+        Returns:
+            Tuple ``(features, targets, norm)`` with z-scored inputs/energies and
+            stats in ``norm`` (``mean_e``, ``std_e``, ``mean_f``, ``std_f``).
+        """
         energies = np.zeros(ninputs)
         coords = np.zeros((ninputs, self.mol.GetNumAtoms(), 3))
 
@@ -651,6 +782,14 @@ class AB3:
         return features.astype(np.float32), targets.astype(np.float32), norm
 
     def eval_symmetric_stretch(self, n_test=300):
+        """Sweep uniform bond-length scale and record true MMFF energies.
+
+        Args:
+            n_test: Number of points along the stretch curve.
+
+        Returns:
+            Tuple ``(scales, features, true_energies)`` (raw features, not z-scored).
+        """
         # Stretching scale (80% to 200%)
         scales = np.linspace(0.8, 1.3, n_test)
 
@@ -686,6 +825,14 @@ class AB3:
         return scales, features, true_energies
 
     def eval_symmetric_bend(self, n_test=300):
+        """Sweep the central B-A-B angle and record true MMFF energies.
+
+        Args:
+            n_test: Number of points along the bend curve.
+
+        Returns:
+            Tuple ``(angles_deg, features, true_energies)`` (raw features, not z-scored).
+        """
         # Strategy is to keep B-atoms in a ring spaced 120deg apart
         # Change the angle that the ring is relative to the central A atom
         # Should find optimal A-B angle this way
@@ -731,18 +878,35 @@ class AB3:
         return angles_deg, features, true_energies
 
     def evaluations(self):
+        """Return named evaluation functions for stretch and bend curves."""
         return {
             "stretch": self.eval_symmetric_stretch,
             "bend": self.eval_symmetric_bend,
         }
 
     def eval_curves(self, n_test=300):
+        """Yield stretch and bend evaluation curves for plotting.
+
+        Yields:
+            ``(name, x, features, true_energy)`` for each curve in ``evaluations()``.
+        """
         for name, func in self.evaluations().items():
             x, features, true_e = func(n_test)
             yield name, x, features, true_e
 
 
 def predict_curve(net, inputs, n_test, norm):
+    """Run a CPU forward pass and return energies in physical units.
+
+    Args:
+        net: Trained ``Network`` (eval forces CPU on hidden layers).
+        inputs: Network input, shape ``(n_features, n_test)``.
+        n_test: Number of points to predict.
+        norm: Dict with ``mean_e`` and ``std_e`` from training.
+
+    Returns:
+        Predicted energies, length ``n_test``.
+    """
     inputs = np.ascontiguousarray(inputs, dtype=np.float32)
     for layer in net.layers:
         layer.current_batch = n_test
