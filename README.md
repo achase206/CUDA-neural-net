@@ -1,41 +1,6 @@
-# Project 2 - Implementing Neural Network in CUDA
+# Porting a Neural Network to CUDA
 
-In this repository is code that "discovers" the Morse potential via a feedforward neural network and backpropagation.
-You'll now work towards getting the code running efficiently on GPUs.
-As you'll note, this `README.md` doesn't include much specific information on exactly what you should do.
-Use the skills and knowledge you've gained over the course of this semester to make intelligent decisions wherever the instructions leave room for interpretation.
-
-## Task 1 - Port the Code to GPUs
-
-The code currently runs on the CPU.
-Rewrite it to run on GPUs, making an effort to optimize for efficiency.
-
-## Task 2 - Profile the Code
-
-Perform profiling tests on Perlmutter, including analysis of Roofline plots.
-Analyze the time cost of training your model with respect to the number of hidden layers, the size of the hidden layers, and the size of the training dataset.
-Include your data and plots here, and explain your conclusions regarding the profiling results.
-
-## Task 3 - Increase the Size of the Calculation
-
-Note that the Morse potential problem is too small to effectively utilize Perlmutter's resources.
-Modify your code to solve a more physically complex problem that can better utilize the Perlmutter GPUs.
-For example, what if instead of trying to learn a Morse potential for a two-body system, you tried to learn a potential energy surface for a three-body or four-body system?
-You may select a physical problem unrelated to molecular dynamics, if you prefer.
-Provide this code **in addition** to the code for Tasks 1 and 2; in other words, submit code that solves the new problem as well as code that discovers the Morse potential.
-
-Repeat your Perlmutter profiling calculations with the new system and discuss your results.
-
-## Task 4 - Discuss the Code
-
-Discuss your code's parallelization strategy.
-Why did you choose this strategy?
-In what ways could the code's performance be improved?
-Describe some ways in which your neural network implementation would need to change to accommodate machine learning in the context of a condensed-phase molecular dynamics simulation involving thousands of atoms.
-
-Your response to this task should be fairly extensive (>1,000 words).
-
-## Answers
+#### Alex Chase
 
 ### Overview
 The purpose of this project was to port over a basic neural network implementation that runs on a CPU, to a code that runs on a GPU. The general strategy was to limit data transfers from the CPU to GPU as much as possible and perform all arithmetic logic via custom CUDA kernels using pycuda. Initially a simple 1-dimensional energy problem for the Morse potential was used as a basic example. This problem was trivial to compute even on a CPU. A more complex, four-body problem to calculate the potential energy surface of an AB3 molecule like ammonia was used as a more computationally difficult training problem. Each of these problems were profiled on Perlmutter with varying network depth, width and batch sizes. Additionally the accuracy of solving the AB3 problem based on depth and width was assessed.
